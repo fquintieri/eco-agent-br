@@ -5,7 +5,13 @@ from dotenv import load_dotenv
 
 # Dependências do LangGraph e LangChain
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, BaseMessage
+from langchain_core.messages import (
+    SystemMessage,
+    HumanMessage,
+    AIMessage,
+    ToolMessage,
+    BaseMessage
+)
 from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
@@ -14,7 +20,7 @@ from langgraph.prebuilt import ToolNode, tools_condition
 """
 ==============================================================================
 EcoAgent BR - Módulo LangGraph (Máquina de Estados / Grafo)
-Recursos: State Machine (Nós + Arestas) + Guardrail + Validação de Resposta
+Recursos: State Machine (Nós + Arestas) + Token Saver (Janela Deslizante) + Guardrail
 ==============================================================================
 """
 
@@ -79,9 +85,9 @@ Você é o **EcoAgent BR**, um analista macroeconômico sênior especializado EX
      * PASSO 1: Invoque TODAS as 3 ferramentas (`selic_langgraph_tool`, `ipca_langgraph_tool`, `usd_langgraph_tool`).
      * REGRA CRÍTICA: NÃO escreva nenhuma tabela ou texto com placeholders como '<function=...>' antes das ferramentas retornarem. Aguarde o retorno das ferramentas!
      * PASSO 2: Após receber os resultados das ferramentas, monte a resposta final em Markdown:
-       ###  Resumo Executivo
-       ###  Tabela de Indicadores Econômicos (com os valores numéricos reais)
-       ###  Análise de Impacto e Estratégia de Investimentos (incluindo cálculo do Juro Real ≈ SELIC - IPCA)
+       ### 📌 Resumo Executivo
+       ### 📊 Tabela de Indicadores Econômicos (com os valores numéricos reais)
+       ### 💡 Análise de Impacto e Estratégia de Investimentos (incluindo cálculo do Juro Real ≈ SELIC - IPCA)
 """
 
 
@@ -104,6 +110,10 @@ def construir_grafo_ecoagent():
     api_key = os.getenv("LLM_API_KEY")
     model_name = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
+    # Sanitiza caso o valor no .env venha com o prefixo 'llm_model='
+    if "llm_model=" in model_name.lower():
+        model_name = model_name.split("=")[-1]
+
     # Configuração do LLM via ChatOpenAI do LangChain
     llm = ChatOpenAI(
         model=model_name,
@@ -115,15 +125,34 @@ def construir_grafo_ecoagent():
     # Acopla as ferramentas ao modelo
     llm_com_tools = llm.bind_tools(ferramentas_catalogadas)
 
-    # Nó do Agente (Raciocínio)
+    # Nó do Agente (Raciocínio com Gerenciador de Contexto/Tokens)
     def no_agente(state: AgentState) -> Dict[str, Any]:
-        historico_mensagens = state["messages"]
+        todas_mensagens = state["messages"]
 
-        # Garante que o System Prompt esteja no topo da janela de contexto
-        if not any(isinstance(m, SystemMessage) for m in historico_mensagens):
-            historico_mensagens = [SystemMessage(content=SYSTEM_PROMPT)] + historico_mensagens
+        # Filtra apenas mensagens de conversação (não de sistema)
+        mensagens_sem_system = [m for m in todas_mensagens if not isinstance(m, SystemMessage)]
 
-        resposta_llm = llm_com_tools.invoke(historico_mensagens)
+        # Aplica a Janela Deslizante (Sliding Window): mantemos até as últimas 8 mensagens no contexto
+        janela = mensagens_sem_system[-8:] if len(mensagens_sem_system) > 8 else mensagens_sem_system
+
+        # Garantia de Integridade de Tool Calling:
+        # Se a janela começar com uma ToolMessage órfã, removemos até encontrar uma HumanMessage ou AIMessage
+        while janela and isinstance(janela[0], ToolMessage):
+            janela = janela[1:]
+
+        # Truncagem de Texto (Token Saver): Resume relatórios longos de turnos anteriores
+        contexto_otimizado: List[BaseMessage] = [SystemMessage(content=SYSTEM_PROMPT)]
+        
+        for idx, msg in enumerate(janela):
+            # Se for uma resposta em texto do assistente em um turno anterior com mais de 200 caracteres, trunca
+            is_ultima_msg = (idx == len(janela) - 1)
+            if isinstance(msg, AIMessage) and len(msg.content) > 200 and not msg.tool_calls and not is_ultima_msg:
+                conteudo_resumido = msg.content[:200] + "... [resumo do histórico]"
+                contexto_otimizado.append(AIMessage(content=conteudo_resumido))
+            else:
+                contexto_otimizado.append(msg)
+
+        resposta_llm = llm_com_tools.invoke(contexto_otimizado)
         return {"messages": [resposta_llm]}
 
     # Instancia o Grafo de Estados
@@ -177,7 +206,7 @@ def validar_resposta_do_agente(resposta: str, eh_relatorio_completo: bool = Fals
 # ==============================================================================
 if __name__ == "__main__":
     print("==================================================")
-    print("  EcoAgent BR (LangGraph) - Chat Interativo")
+    print("  EcoAgent BR (LangGraph) - Chat Interativo Otimizado")
     print("  Estudo de Caso: Agente Baseado em Máquina de Estados (Grafo)")
     print("  Digite 'sair', 'exit' ou 'quit' para encerrar.")
     print("==================================================")
@@ -220,7 +249,7 @@ if __name__ == "__main__":
             if not validacao["valido"]:
                 print("\n[ALERTA DE VALIDAÇÃO]: Inconsistências encontradas:")
                 for erro in validacao["erros"]:
-                    print(f"  - {erro}")
+                    print(f"  - ⚠️ {erro}")
                 print("--------------------------------------------------")
 
             print("\nRESPOSTA FINAL DO AGENTE:")

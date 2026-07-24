@@ -17,7 +17,7 @@ from crewai.tools import BaseTool
 """
 ==============================================================================
 EcoAgent BR - Módulo CrewAI (orientado a Papéis e Tarefas)
-Recursos: Subclasse BaseTool + Pydantic + Memória Multi-turno + Validador
+Recursos: Subclasse BaseTool + Pydantic + Memória Otimizada + Validador
 ==============================================================================
 """
 
@@ -115,6 +115,10 @@ def executar_agente_crewai(entrada_usuario: str, historico: List[Dict[str, str]]
     api_key = os.getenv("LLM_API_KEY")
     model_name = os.getenv("LLM_MODEL", "llama-3.3-70b-versatile")
 
+    # Sanitiza caso o valor no .env venha com o prefixo 'llm_model='
+    if "llm_model=" in model_name.lower():
+        model_name = model_name.split("=")[-1]
+
     llm = LLM(
         model=f"openai/{model_name}",
         base_url=base_url,
@@ -124,7 +128,7 @@ def executar_agente_crewai(entrada_usuario: str, historico: List[Dict[str, str]]
 
     analista_agente = Agent(
         role="Analista Macroeconômico Sênior",
-        goal="Fornecer respostas extremamente precisas, adaptando o formato entre respostas curtas e relatórios estruturados.",
+        goal="Fornecer respostas extremamente precisas sobre a economia brasileira com base em dados oficiais.",
         backstory=(
             "Você é o EcoAgent BR, especialista em macroeconomia e mercado financeiro do Brasil. "
             "Seu compromisso é responder dúvidas com dados reais do Banco Central. "
@@ -136,21 +140,28 @@ def executar_agente_crewai(entrada_usuario: str, historico: List[Dict[str, str]]
         llm=llm
     )
 
+    # Otimização de Histórico: Trunca mensagens antigas para não estourar o limite de tokens (Rate Limit 429)
     texto_historico = ""
     if historico:
-        texto_historico = "HISTÓRICO DA CONVERSA:\n"
+        texto_historico = "HISTÓRICO RECENTE:\n"
         for item in historico[-2:]:
-            texto_historico += f"{item['role'].upper()}: {item['content']}\n"
+            conteudo = item['content']
+            if len(conteudo) > 200:
+                conteudo = conteudo[:200] + "... [resumo do histórico]"
+            texto_historico += f"{item['role'].upper()}: {conteudo}\n"
         texto_historico += "\n"
 
     instrucoes_tarefa = f"""
-    {texto_historico}
-    SOLICITAÇÃO DO USUÁRIO: '{entrada_usuario}'
+    {texto_historico}SOLICITAÇÃO DO USUÁRIO: '{entrada_usuario}'
+
+    REGRA CRÍTICA DE EXECUÇÃO EM 2 ETAPAS:
+    1. Se precisar consultar indicadores (SELIC, IPCA, Dólar), emita a chamada de ferramenta PRIMEIRO.
+    2. NUNCA escreva placeholders, códigos ou tags como '<function=...>' no texto final. Aguarde os dados reais das ferramentas para preencher as respostas e tabelas.
 
     DIRETRIZES DE ATENDIMENTO:
 
     1. GUARDRAIL DE ESCOPO:
-       - Se a Pergunta for fora do escopo econômico (ex: clima, esportes, receitas, futebol):
+       - Se a pergunta for fora do escopo econômico (ex: clima, esportes, receitas, futebol):
          * NÃO execute NENHUMA ferramenta.
          * Responda: "Como sou o EcoAgent BR, meu foco é exclusivamente a análise econômica do Brasil e indicadores do Banco Central. Como posso te ajudar com a taxa SELIC, IPCA, Dólar ou estratégias de investimentos hoje?"
 
@@ -165,15 +176,15 @@ def executar_agente_crewai(entrada_usuario: str, historico: List[Dict[str, str]]
          * Responda em 1 parágrafo direto com o valor e a data de referência. NÃO crie tabelas.
 
     4. RELATÓRIOS E ANÁLISES DE INVESTIMENTO:
-       - Se for 'qual o melhor investimento?', 'me passe um panorama', 'relatório completo':
+       - Se for 'qual o melhor investimento?', 'me passe um panorama', 'relatório completo', 'onde aplicar R$ 1000':
          * Execute TODAS as 3 ferramentas (`Obter Taxa SELIC Meta`, `Obter Inflação IPCA` e `Obter Cotação do Dólar PTAX`).
-         * Estruture o relatório completo em Markdown com:
-           ###  Resumo Executivo
-           ###  Tabela de Indicadores Econômicos
-           ###  Análise de Impacto e Estratégia de Investimentos (incluindo cálculo de Juro Real ≈ SELIC - IPCA)
+         * Somente APÓS receber o retorno numérico das 3 ferramentas, estruture o relatório em Markdown:
+           ### 📌 Resumo Executivo
+           ### 📊 Tabela de Indicadores Econômicos (preenchida com os valores numéricos reais)
+           ### 💡 Análise de Impacto e Estratégia de Investimentos (incluindo cálculo de Juro Real ≈ SELIC - IPCA)
     """
 
-    formato_esperado = "Resposta textual ou relatório formatado rigorosamente de acordo com a diretriz correspondente."
+    formato_esperado = "Resposta textual ou relatório formatado com valores reais, sem placeholders ou tags de função no texto."
 
     tarefa_analise = Task(
         description=instrucoes_tarefa,
@@ -197,7 +208,7 @@ def executar_agente_crewai(entrada_usuario: str, historico: List[Dict[str, str]]
 # ==============================================================================
 if __name__ == "__main__":
     print("==================================================")
-    print("  EcoAgent BR (CrewAI) - Chat Interativo (70B)")
+    print("  EcoAgent BR (CrewAI) - Chat Interativo Otimizado")
     print("  Estudo de Caso: Agente Baseado em Papéis Sênior")
     print("  Digite 'sair', 'exit' ou 'quit' para encerrar.")
     print("==================================================")
@@ -228,7 +239,7 @@ if __name__ == "__main__":
             if not validacao["valido"]:
                 print("\n[ALERTA DE VALIDAÇÃO]: Inconsistências encontradas:")
                 for erro in validacao["erros"]:
-                    print(f"  - {erro}")
+                    print(f"  - ⚠️ {erro}")
                 print("--------------------------------------------------")
 
             print("\nRESPOSTA FINAL DO AGENTE:")

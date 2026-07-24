@@ -6,35 +6,39 @@ from typing import List, Dict, Any
 from dotenv import load_dotenv
 from openai import OpenAI
 
-# No Windows o console padrao usa cp1252 e quebra acentos/emojis; forcamos UTF-8.
+# No Windows o console padrão usa cp1252 e quebra acentos/emojis; forçamos UTF-8.
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stdin.reconfigure(encoding="utf-8")
 
-# Coloca a raiz do projeto no sys.path para que 'shared.bcb_tools' seja importavel
-# independentemente do diretorio de onde o script for chamado.
+# Coloca a raiz do projeto no sys.path para que 'shared.bcb_tools' seja importável
+# independentemente do diretório de onde o script for chamado.
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-# Importa os esquemas em formato JSON Schema (TOOLS_SCHEMA) e o mapa de funcoes executaveis (TOOLS_CATALOG).
+# Importa os esquemas em formato JSON Schema (TOOLS_SCHEMA) e o mapa de funções executáveis (TOOLS_CATALOG).
 from shared.bcb_tools import TOOLS_SCHEMA, TOOLS_CATALOG
 
-# Carrega as variaveis de ambiente definidas no arquivo .env localizado na raiz do projeto.
+# Carrega as variáveis de ambiente definidas no arquivo .env localizado na raiz do projeto.
 load_dotenv()
 
 
 def obter_cliente_openai() -> tuple[OpenAI, str]:
     """Instancia o cliente OpenAI a partir do .env e devolve (cliente, modelo).
 
-    Usamos a SDK da OpenAI como protocolo comum: o mesmo codigo fala com Groq,
-    Ollama, vLLM ou qualquer backend compativel bastando trocar base_url/api_key.
-    O fallback aponta para um Ollama local para quem nao tem chave de nuvem.
+    Usamos a SDK da OpenAI como protocolo comum: o mesmo código fala com Groq,
+    Ollama, vLLM ou qualquer backend compatível bastando trocar base_url/api_key.
+    O fallback aponta para um Ollama local para quem não tem chave de nuvem.
     """
     base_url = os.getenv("LLM_BASE_URL", "http://localhost:11434/v1")
     api_key = os.getenv("LLM_API_KEY", "ollama")
     model_name = os.getenv("LLM_MODEL", "qwen2.5:7b")
 
-    print(f"[CONFIGURACAO] Endpoint: {base_url}")
-    print(f"[CONFIGURACAO] Modelo Selecionado: {model_name}")
+    # Sanitiza caso o valor no .env venha com o prefixo 'llm_model='
+    if "llm_model=" in model_name.lower():
+        model_name = model_name.split("=")[-1]
+
+    print(f"[CONFIGURAÇÃO] Endpoint: {base_url}")
+    print(f"[CONFIGURAÇÃO] Modelo Selecionado: {model_name}")
 
     client = OpenAI(base_url=base_url, api_key=api_key)
     return client, model_name
@@ -42,8 +46,7 @@ def obter_cliente_openai() -> tuple[OpenAI, str]:
 
 # O System Prompt concentra todo o comportamento do agente: escopo, política de uso
 # de ferramentas e formato de saída. Os quatro módulos deste estudo compartilham as
-# mesmas quatro regras (guardrail de escopo, saudação, consulta pontual e relatório),
-# de modo que a comparação isole o framework — não o prompt.
+# mesmas quatro regras (guardrail de escopo, saudação, consulta pontual e relatório).
 SYSTEM_PROMPT = """
 Você é o **EcoAgent BR**, um analista macroeconômico sênior especializado EXCLUSIVAMENTE em indicadores do Banco Central do Brasil e finanças.
 
@@ -71,82 +74,93 @@ REGRA TRANSVERSAL: nunca anuncie que "vai consultar" — apenas execute as chama
 
 
 def contem_degeneracao(texto: str) -> bool:
-    """
-    Verifica se o texto retornado contem caracteres fora do padrao PT-BR/EN.
-    Mecanismo de defesa contra o colapso de amostragem (Degradaçao de Tokens).
+    """Verifica se o texto retornado contém caracteres fora do padrão PT-BR/EN.
+
+    Mecanismo de defesa contra o colapso de amostragem (Degradação de Tokens).
     """
     if not texto:
         return False
-    # Detecta caracteres asiaticos (CJK), cirilicos ou simbolos desconexos
-    padrao_estranho = re.compile(r'[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]')
+    padrao_estranho = re.compile(
+        r"[\u3000-\u303f\u3040-\u309f\u30a0-\u30ff\uff00-\uffef\u4e00-\u9faf]"
+    )
     return bool(padrao_estranho.search(texto))
 
 
-def executar_agente(pergunta_usuario: str, max_passos: int = 5) -> str:
-    """Roda o loop ReAct (Reasoning + Acting) escrito na mao, sem framework.
+def executar_agente(
+    pergunta_usuario: str,
+    historico: List[Dict[str, str]] = None,
+    max_passos: int = 5,
+) -> str:
+    """Roda o loop ReAct (Reasoning + Acting) escrito na mão, com suporte a histórico e truncagem.
 
-    O ciclo por passo e: enviar o historico + os schemas das ferramentas -> ler a
-    decisao do modelo -> se ele pediu ferramentas, executa-las localmente e devolver
-    a observacao ao historico -> repetir; se ele respondeu em texto, encerrar.
-    'max_passos' e o freio contra loops infinitos.
+    O ciclo por passo é: enviar o histórico + os schemas das ferramentas -> ler a
+    decisão do modelo -> se ele pediu ferramentas, executá-las localmente e devolver
+    a observação ao histórico do turno -> repetir; se ele respondeu em texto, encerrar.
     """
     client, model_name = obter_cliente_openai()
 
-    # A LLM e stateless: nao guarda nada entre requisicoes. Toda a memoria de curto
-    # prazo vive nesta lista, reenviada por inteiro a cada iteracao do loop.
+    # Inicia a estrutura de mensagens enviadas na requisição
     messages: List[Dict[str, Any]] = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": pergunta_usuario}
+        {"role": "system", "content": SYSTEM_PROMPT}
     ]
+
+    # Injeta o histórico recente com truncagem inteligente para economizar tokens
+    if historico:
+        for msg in historico[-4:]:  # Mantém até os últimos 2 turnos da conversa
+            conteudo = msg["content"]
+            if len(conteudo) > 200:
+                conteudo = conteudo[:200] + "... [resumo do histórico]"
+            messages.append({"role": msg["role"], "content": conteudo})
+
+    # Adiciona a pergunta atual do usuário
+    messages.append({"role": "user", "content": pergunta_usuario})
 
     print("\n--- INICIO DO AGENT LOOP ---")
     print(f"Pergunta do Usuario: '{pergunta_usuario}'\n")
 
     # ==========================================================================
-    # LAÇO PRINCIPAL DE EXECUCAO (AGENT LOOP / REACT CYCLE)
+    # LAÇO PRINCIPAL DE EXECUÇÃO (AGENT LOOP / REACT CYCLE)
     # ==========================================================================
     for passo in range(1, max_passos + 1):
-        print(f"[PASSO {passo}/{max_passos}] Enviando contexto com {len(messages)} mensagem(ns) para a LLM...")
+        print(
+            f"[PASSO {passo}/{max_passos}] Enviando contexto com {len(messages)} mensagem(ns) para a LLM..."
+        )
 
         try:
-            # 1. ETAPA DE RACIOCINIO (REASONING):
-            # Envia todo o historico de mensagens e o esquema de ferramentas (TOOLS_SCHEMA).
+            # 1. ETAPA DE RACIOCÍNIO (REASONING):
             response = client.chat.completions.create(
                 model=model_name,
                 messages=messages,
-                tools=TOOLS_SCHEMA,        # Catalogo de schemas JSON enviado a LLM
-                tool_choice="auto",        # A LLM decide autonomamente se usa ou nao ferramentas
-                temperature=0.0            # Temperatura 0.0 para maximo determinismo e estabilidade
+                tools=TOOLS_SCHEMA,  # Catálogo de schemas JSON enviado à LLM
+                tool_choice="auto",  # A LLM decide autonomamente se usa ou não ferramentas
+                temperature=0.0,  # Temperatura 0.0 para máximo determinismo e estabilidade
             )
         except Exception as erro:
-            mensagem_erro = f"Erro na comunicacao com a API da LLM ({model_name}): {str(erro)}"
-            print(f"[ERRO DE CONEXAO] {mensagem_erro}")
+            mensagem_erro = f"Erro na comunicação com a API da LLM ({model_name}): {str(erro)}"
+            print(f"[ERRO DE CONEXÃO] {mensagem_erro}")
             return mensagem_erro
 
-        # Extrai a mensagem de resposta gerada pela LLM nesta iteracao
+        # Extrai a mensagem de resposta gerada pela LLM nesta iteração
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
 
-        # Adiciona a resposta do assistente (seja texto ou intencao de chamar ferramenta) ao historico.
-        # Isso e obrigatorio para manter a integridade do protocolo da API da OpenAI.
+        # Adiciona a resposta do assistente ao histórico do turno
         messages.append(response_message)
 
         # ======================================================================
-        # CONDICAO DE RAMIFICACAO 1: A LLM SOLICITOU EXECUCAO DE FERRAMENTAS (ACAO)
+        # CONDIÇÃO DE RAMIFICAÇÃO 1: A LLM SOLICITOU EXECUÇÃO DE FERRAMENTAS (AÇÃO)
         # ======================================================================
         if tool_calls:
-            print(f"[RACIOCINIO DA LLM] A LLM identificou a necessidade de executar {len(tool_calls)} ferramenta(s).")
+            print(
+                f"[RACIOCÍNIO DA LLM] A LLM identificou a necessidade de executar {len(tool_calls)} ferramenta(s)."
+            )
 
             for tool_call in tool_calls:
                 function_name = tool_call.function.name
                 tool_call_id = tool_call.id
                 raw_arguments = tool_call.function.arguments
 
-                # --------------------------------------------------------------
-                # PARSING DEFENSIVO DE ARGUMENTOS (MULTICLOUD & LOCAL SAFETY)
-                # Dicionarios nulos (None) ou strings invalidas sao convertidos para {}
-                # para evitar erros de desempacotamento (**args).
-                # --------------------------------------------------------------
+                # Parsing defensivo de argumentos JSON
                 if raw_arguments:
                     try:
                         function_args = json.loads(raw_arguments)
@@ -155,66 +169,70 @@ def executar_agente(pergunta_usuario: str, max_passos: int = 5) -> str:
                 else:
                     function_args = {}
 
-                # Garantia absoluta: Se o JSON deserializado nao for um dicionario Python, forca {}
                 if not isinstance(function_args, dict):
                     function_args = {}
 
-                print(f"[ACAO DO HARNESS] Solicitando execucao da funcao local: '{function_name}' com parametros: {function_args}")
+                print(
+                    f"[AÇÃO DO HARNESS] Solicitando execução da função local: '{function_name}' com parâmetros: {function_args}"
+                )
 
-                # Verifica se a funcao solicitada existe no nosso catalogo de funcoes registradas
+                # Executa a função localmente se ela existir no catálogo
                 if function_name in TOOLS_CATALOG:
-                    # Recupera a referencia da funcao Python e a executa passando os argumentos
                     funcao_python = TOOLS_CATALOG[function_name]
                     resultado_ferramenta = funcao_python(**function_args)
                 else:
-                    resultado_ferramenta = f"Erro: A ferramenta '{function_name}' nao existe no catalogo do sistema."
+                    resultado_ferramenta = f"Erro: A ferramenta '{function_name}' não existe no catálogo do sistema."
 
-                print(f"[OBSERVACAO DA FERRAMENTA] Retorno obtido da API externa: {resultado_ferramenta}")
+                print(
+                    f"[OBSERVAÇÃO DA FERRAMENTA] Retorno obtido da API externa: {resultado_ferramenta}"
+                )
 
-                # 2. ETAPA DE FEEDBACK / OBSERVACAO (OBSERVATION):
-                # O resultado retornado e empacotado em uma nova mensagem com 'role': 'tool'.
-                # E crucial incluir o 'tool_call_id' para sincronizacao do historico.
+                # 2. ETAPA DE FEEDBACK / OBSERVAÇÃO (OBSERVATION):
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call_id,
                     "name": function_name,
-                    "content": str(resultado_ferramenta)
+                    "content": str(resultado_ferramenta),
                 })
 
-            # O laço continuara para o proximo passo, enviando o resultado da API de volta a LLM.
-
         # ======================================================================
-        # CONDICAO DE RAMIFICACAO 2: A LLM GEROU UMA RESPOSTA EM TEXTO (CONCLUSAO)
+        # CONDIÇÃO DE RAMIFICAÇÃO 2: A LLM GEROU UMA RESPOSTA EM TEXTO (CONCLUSÃO)
         # ======================================================================
         else:
-            print("[CONCLUIDO] A LLM finalizou o raciocinio sem solicitar novas ferramentas.")
+            print(
+                "[CONCLUÍDO] A LLM finalizou o raciocínio sem solicitar novas ferramentas."
+            )
             print("--- FIM DO AGENT LOOP ---\n")
 
             conteudo_resposta = response_message.content
 
-            # TRATAMENTO DE RETORNO NULO / VAZIO (Fallback alinhado a Skill):
+            # Tratamento para retorno nulo ou vazio
             if not conteudo_resposta or not conteudo_resposta.strip():
                 conteudo_resposta = (
-                    "Ola! Eu sou o **EcoAgent BR**, seu assistente especializado em indicadores economicos do Banco Central.\n\n"
+                    "Olá! Eu sou o **EcoAgent BR**, seu assistente especializado em indicadores econômicos do Banco Central.\n\n"
                     "Posso te ajudar a consultar em tempo real:\n"
-                    "* **Taxa SELIC** (Taxa basica de juros)\n"
-                    "* **IPCA** (Indice oficial de inflaçao)\n"
-                    "* **Cotaçao do Dolar** (Taxa Ptax / Comercial)\n\n"
-                    "Qual indicador voce gostaria de verificar agora?"
+                    "* **Taxa SELIC** (Taxa básica de juros)\n"
+                    "* **IPCA** (Índice oficial de inflação)\n"
+                    "* **Cotação do Dólar** (Taxa Ptax / Comercial)\n\n"
+                    "Qual indicador você gostaria de verificar agora?"
                 )
 
-            # FILTRO DE SANITIZAÇÃO: Impede a exibicao de respostas corrompidas por degradaçao de tokens
+            # Filtro de sanitização contra degradação de tokens
             if contem_degeneracao(conteudo_resposta):
-                print("[AVISO DE SEGURANÇA] O modelo gerou uma resposta corrompida/degenerada.")
-                return "Ocorreu uma falha na geracao da resposta pelo modelo. Por favor, refaça a pergunta de forma mais direta."
+                print(
+                    "[AVISO DE SEGURANÇA] O modelo gerou uma resposta corrompida/degenerada."
+                )
+                return "Ocorreu uma falha na geração da resposta pelo modelo. Por favor, refaça a pergunta de forma mais direta."
 
             return conteudo_resposta
 
     # ==========================================================================
-    # CONDICAO DE PARDA POR EXCEDER O LIMITE DE ITERACOES (MAX STEPS)
+    # CONDIÇÃO DE PARADA POR EXCEDER O LIMITE DE ITERAÇÕES (MAX STEPS)
     # ==========================================================================
-    print("[AVISO] O agente atingiu o limite maximo de passos sem concluir a tarefa.")
-    return "Nao foi possivel concluir a analise dentro do limite maximo de iteracoes estabelecido."
+    print(
+        "[AVISO] O agente atingiu o limite máximo de passos sem concluir a tarefa."
+    )
+    return "Não foi possível concluir a análise dentro do limite máximo de iterações estabelecido."
 
 
 # ==============================================================================
@@ -223,35 +241,43 @@ def executar_agente(pergunta_usuario: str, max_passos: int = 5) -> str:
 if __name__ == "__main__":
     print("==================================================")
     print("  EcoAgent BR (Python Puro) - Chat Interativo")
-    print("  Estudo de Caso: Agente Autonomo ReAct sem Frameworks")
+    print("  Estudo de Caso: Agente Autônomo ReAct sem Frameworks")
     print("  Digite 'sair', 'exit' ou 'quit' para encerrar.")
     print("==================================================")
 
-    # Laço continuo para manter a sessao do terminal ativa
+    # Armazena a memória de sessão acumulada do chat no terminal
+    historico_sessao: List[Dict[str, str]] = []
+
     while True:
         try:
-            # Captura a entrada do usuario no terminal
-            entrada_usuario = input("\nVoce: ").strip()
+            entrada_usuario = input("\nVocê: ").strip()
 
-            # Condicao de saida do chat
             if entrada_usuario.lower() in ["sair", "exit", "quit"]:
-                print("Encerrando a sessao do EcoAgent BR. Ate logo!")
+                print("Encerrando a sessão do EcoAgent BR. Até logo!")
                 break
 
-            # Ignora entradas vazias (pressionar Enter sem digitar nada)
             if not entrada_usuario:
                 continue
 
-            # Executa a rotina do agente para processar a pergunta
-            resposta_final = executar_agente(entrada_usuario)
+            # Passa a entrada atual juntamente com o histórico mantido no Python puro
+            resposta_final = executar_agente(entrada_usuario, historico_sessao)
 
-            # Exibe o resultado consolidado no console
+            # Atualiza o histórico acumulado para as próximas rodadas
+            historico_sessao.append(
+                {"role": "user", "content": entrada_usuario}
+            )
+            historico_sessao.append(
+                {"role": "assistant", "content": resposta_final}
+            )
+
             print("\nRESPOSTA FINAL DO AGENTE:")
             print(resposta_final)
             print("=" * 50)
 
         except (KeyboardInterrupt, EOFError):
-            print("\nSessao encerrada pelo usuario. Ate logo!")
+            print("\nSessão encerrada pelo usuário. Até logo!")
             break
         except Exception as erro_geral:
-            print(f"\n[ERRO CRITICO] Ocorreu uma falha inesperada durante a execucao: {erro_geral}")
+            print(
+                f"\n[ERRO CRÍTICO] Ocorreu uma falha inesperada durante a execução: {erro_geral}"
+            )
