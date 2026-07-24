@@ -1,0 +1,19 @@
+# Requisições HTTP para consumo das APIs REST do Banco Central do Brasil
+requests>=2.31.0
+
+# Gerenciamento de variáveis de ambiente (.env) para chaves de API e URLs
+python-dotenv>=1.0.0
+
+# SDK oficial da OpenAI (utilizado no Python puro e para conexão com a Groq)
+openai>=1.12.0
+
+# Framework da Hugging Face para orquestração leve de Agentes Autônomos e Function Calling (Teste 2)
+smolagents>=1.0.0
+
+# Framework para orquestração de Agentes Autônomos baseados em Papéis e Tarefas / Role-Based (Teste 3)
+crewai>=0.100.0
+
+# Framework LangGraph & LangChain
+langgraph>=0.2.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
