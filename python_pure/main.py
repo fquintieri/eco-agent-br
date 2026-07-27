@@ -5,6 +5,7 @@ import re
 from typing import List, Dict, Any
 from dotenv import load_dotenv
 from openai import OpenAI
+import inspect
 
 # No Windows o console padrão usa cp1252 e quebra acentos/emojis; forçamos UTF-8.
 if sys.platform == "win32":
@@ -179,13 +180,23 @@ def executar_agente(
                 # Executa a função localmente se ela existir no catálogo
                 if function_name in TOOLS_CATALOG:
                     funcao_python = TOOLS_CATALOG[function_name]
-                    resultado_ferramenta = funcao_python(**function_args)
-                else:
-                    resultado_ferramenta = f"Erro: A ferramenta '{function_name}' não existe no catálogo do sistema."
 
-                print(
-                    f"[OBSERVAÇÃO DA FERRAMENTA] Retorno obtido da API externa: {resultado_ferramenta}"
-                )
+                    # Inspeciona a assinatura real da função Python
+                    sig = inspect.signature(funcao_python)
+
+                    # Se a função não espera nenhum parâmetro (caso da get_selic_rate)
+                    if len(sig.parameters) == 0:
+                        resultado_ferramenta = funcao_python()
+                    else:
+                        # Se a função espera parâmetros, filtra apenas os que ela aceita de fato
+                        args_validos = {
+                            k: v for k, v in function_args.items() if k in sig.parameters
+                        }
+                        resultado_ferramenta = funcao_python(**args_validos)
+                else:
+                    resultado_ferramenta = (
+                        f"Erro: A ferramenta '{function_name}' não existe no catálogo do sistema."
+                    )
 
                 # 2. ETAPA DE FEEDBACK / OBSERVAÇÃO (OBSERVATION):
                 messages.append({
