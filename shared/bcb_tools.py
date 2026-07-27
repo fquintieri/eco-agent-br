@@ -1,3 +1,4 @@
+import json
 import requests
 from typing import Dict, Any, Callable
 
@@ -8,10 +9,55 @@ Este módulo contém as funções responsáveis por realizar chamadas HTTP para 
 Gerenciador de Séries Temporais (SGS) do Banco Central do Brasil.
 """
 
+def get_economic_overview(*args, **kwargs) -> str:
+    """Obtém SELIC, IPCA e Dólar de uma só vez e pré-calcula o Juro Real aproximado em Python."""
+    try:
+        # Executa as 3 consultas no Python
+        selic_raw = json.loads(get_selic_rate())
+        ipca_raw = json.loads(get_ipca_rate())
+        usd_raw = json.loads(get_usd_exchange_rate())
+
+        # Extrai e limpa os valores numéricos para cálculo
+        def limpar_valor(val_str: str) -> float:
+            texto = (
+                val_str.replace("% ao ano", "")
+                .replace("%", "")
+                .replace(" BRL", "")
+                .strip()
+            )
+            return float(texto.replace(",", "."))
+
+        v_selic = limpar_valor(selic_raw["valor_atual"])
+        v_ipca_mensal = limpar_valor(ipca_raw["valor_atual"])
+
+        # Cálculo matemático determinístico em Python
+        ipca_anualizado = v_ipca_mensal * 12
+        juro_real_aprox = v_selic - ipca_anualizado
+
+        # Estrutura unificada com cálculos já prontos
+        payload = {
+            "indicadores": {
+                "selic": selic_raw,
+                "ipca": ipca_raw,
+                "dolar": usd_raw,
+            },
+            "calculos_pre_processados": {
+                "ipca_anualizado_aprox": f"{ipca_anualizado:.2f}%",
+                "juro_real_aprox": f"{juro_real_aprox:.2f}%",
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    except Exception as e:
+        return json.dumps(
+            {"erro": f"Falha ao gerar panorama econômico: {str(e)}"},
+            ensure_ascii=False,
+        )
+
 def _consultar_sgs(codigo_serie: int, nome_indicador: str, sufixo_valor: str = "%") -> str:
     """
     Função auxiliar privada para realizar requisições genéricas ao SGS/BCB.
-    Evita duplicação de código HTTP e tratamento de exceções.
+    Retorna uma string formatada em JSON estruturado para garantir fidelidade de dados.
     """
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo_serie}/dados/ultimos/1?formato=json"
     
@@ -19,16 +65,26 @@ def _consultar_sgs(codigo_serie: int, nome_indicador: str, sufixo_valor: str = "
         response = requests.get(url, timeout=5)
         if response.status_code == 200:
             data = response.json()
-            valor = data[0]['valor']
-            data_registro = data[0]['data']
-            return f"{nome_indicador}: {valor}{sufixo_valor} (Data de referência: {data_registro})."
+            
+            payload = {
+                "indicador": nome_indicador,
+                "valor_atual": f"{data[0]['valor']}{sufixo_valor}",
+                "data_referencia_oficial": data[0]['data']
+            }
+            return json.dumps(payload, ensure_ascii=False)
         
-        return f"Erro ao consultar {nome_indicador}. Código de status HTTP: {response.status_code}"
+        return json.dumps({
+            "erro": f"Status HTTP {response.status_code} ao buscar {nome_indicador}"
+        }, ensure_ascii=False)
 
     except requests.exceptions.Timeout:
-        return f"Erro: A conexão com o servidor do Banco Central esgotou o tempo limite (timeout) ao buscar {nome_indicador}."
+        return json.dumps({
+            "erro": f"Timeout na conexão com o Banco Central ao buscar {nome_indicador}"
+        }, ensure_ascii=False)
     except requests.exceptions.RequestException as e:
-        return f"Falha na conexão com a API do Banco Central ao buscar {nome_indicador}: {str(e)}"
+        return json.dumps({
+            "erro": f"Falha na conexão com a API do Banco Central ao buscar {nome_indicador}: {str(e)}"
+        }, ensure_ascii=False)
 
 
 # ==============================================================================
@@ -54,14 +110,13 @@ def get_usd_exchange_rate() -> str:
 # MAPEAMENTO E SCHEMAS PARA FUNCTION CALLING
 # ==============================================================================
 
-# Catálogo dinâmico de funções (Chaves alinhadas com o Schema do Agent)
-TOOLS_CATALOG: Dict[str, Callable[[], str]] = {
+TOOLS_CATALOG: Dict[str, Callable[..., str]] = {
     "get_selic_rate": get_selic_rate,
     "get_ipca_rate": get_ipca_rate,
-    "get_usd_exchange_rate": get_usd_exchange_rate
+    "get_usd_exchange_rate": get_usd_exchange_rate,
+    "get_economic_overview": get_economic_overview,  # <--- Nova Tool
 }
 
-# JSON Schema padrão OpenAI
 TOOLS_SCHEMA = [
     {
         "type": "function",
@@ -75,7 +130,7 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "get_ipca_rate",
-            "description": "Obtém o índice de inflação oficial do Brasil (IPCA) acumulado do Banco Central. Use esta ferramenta sempre que o usuário perguntar por 'inflação', 'IPCA' ou 'índice de preços'.",
+            "description": "Obtém o índice de inflação oficial do Brasil (IPCA) acumulado do Banco Central.",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
     },
@@ -86,5 +141,13 @@ TOOLS_SCHEMA = [
             "description": "Obtém a cotação atual do Dólar Ptax/Comercial em Reais (BRL) do Banco Central.",
             "parameters": {"type": "object", "properties": {}, "required": []}
         }
+    },
+    {
+    "type": "function",
+    "function": {
+        "name": "get_economic_overview",
+        "description": "Obtém um panorama completo com SELIC, IPCA, Dólar e o Juro Real pré-calculado. Use esta ferramenta SEMPRE que o usuário pedir um relatório, panorama, análise geral ou onde investir.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
     }
+}
 ]
